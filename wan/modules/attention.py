@@ -1,17 +1,25 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import os
 import torch
 
-try:
-    import flash_attn_interface
-    FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_3_AVAILABLE = False
+# 환경변수로 flash attention 비활성화 가능
+DISABLE_FLASH_ATTN = os.environ.get('DISABLE_FLASH_ATTN', '0') == '1'
 
-try:
-    import flash_attn
-    FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
+if DISABLE_FLASH_ATTN:
+    FLASH_ATTN_3_AVAILABLE = False
     FLASH_ATTN_2_AVAILABLE = False
+else:
+    try:
+        import flash_attn_interface
+        FLASH_ATTN_3_AVAILABLE = True
+    except ModuleNotFoundError:
+        FLASH_ATTN_3_AVAILABLE = False
+
+    try:
+        import flash_attn
+        FLASH_ATTN_2_AVAILABLE = True
+    except ModuleNotFoundError:
+        FLASH_ATTN_2_AVAILABLE = False
 
 import warnings
 
@@ -108,8 +116,7 @@ def flash_attention(
             softmax_scale=softmax_scale,
             causal=causal,
             deterministic=deterministic)[0].unflatten(0, (b, lq))
-    else:
-        assert FLASH_ATTN_2_AVAILABLE
+    elif FLASH_ATTN_2_AVAILABLE:
         x = flash_attn.flash_attn_varlen_func(
             q=q,
             k=k,
@@ -125,6 +132,31 @@ def flash_attention(
             causal=causal,
             window_size=window_size,
             deterministic=deterministic).unflatten(0, (b, lq))
+    else:
+        # Fallback to PyTorch's scaled_dot_product_attention
+        warnings.warn(
+            'Flash attention is not available, using PyTorch scaled_dot_product_attention instead. '
+            'Performance may be impacted.'
+        )
+        # Reshape back to [B, L, N, C] format for PyTorch attention
+        q_reshaped = q.unflatten(0, (b, lq))
+        k_reshaped = k.unflatten(0, (b, lk))
+        v_reshaped = v.unflatten(0, (b, lk))
+
+        # Transpose to [B, N, L, C] for scaled_dot_product_attention
+        q_reshaped = q_reshaped.transpose(1, 2)
+        k_reshaped = k_reshaped.transpose(1, 2)
+        v_reshaped = v_reshaped.transpose(1, 2)
+
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q_reshaped, k_reshaped, v_reshaped,
+            attn_mask=None,
+            is_causal=causal,
+            dropout_p=dropout_p
+        )
+
+        # Transpose back to [B, L, N, C]
+        x = x.transpose(1, 2).contiguous()
 
     # output
     return x.type(out_dtype)
